@@ -65,7 +65,7 @@ from iris.rpc import query_pb2
 from iris.cluster.controller.scheduler import SchedulingContext
 from iris.cluster.controller.transitions import ControllerTransitions
 from iris.cluster.controller.provider import ProviderError
-from iris.cluster.log_store import LogStore, build_log_source
+from iris.cluster.log_store import LogStore
 from iris.cluster.process_status import get_process_status
 from iris.cluster.runtime.profile import is_system_target, parse_profile_target, profile_local_process
 from iris.cluster.types import JobName, WorkerId
@@ -97,8 +97,6 @@ def redact_request_env_vars(
             env_vars[key] = REDACTED_VALUE
     return redacted
 
-
-DEFAULT_MAX_TOTAL_LINES = 100000
 
 # Maximum bundle size in bytes (25 MB) - matches client-side limit
 MAX_BUNDLE_SIZE_BYTES = 25 * 1024 * 1024
@@ -1364,59 +1362,6 @@ class ControllerServiceImpl:
         return provider.get_cluster_status()  # type: ignore[union-attr]
 
     # --- VM Logs ---
-
-    # --- Task/Job Logs (batch fetching) ---
-
-    def get_task_logs(
-        self,
-        request: cluster_pb2.Controller.GetTaskLogsRequest,
-        ctx: RequestContext,
-    ) -> cluster_pb2.Controller.GetTaskLogsResponse:
-        """DEPRECATED: use FetchLogs with regex patterns instead. Scheduled for removal 2026-05-01.
-
-        Forwards to fetch_logs internally, wrapping the response in the legacy format.
-        """
-        job_name = JobName.from_wire(request.id)
-
-        # Build the regex source pattern from the legacy request fields
-        if job_name.is_task:
-            source = build_log_source(job_name, request.attempt_id)
-        elif request.include_children:
-            source = build_log_source(job_name)
-        else:
-            # Direct tasks only: match keys like /user/job/0:attempt but not
-            # /user/job/child-job/0:attempt. Use \d+ to restrict to numeric
-            # task indices, pushing the filter into DuckDB.
-            escaped_wire = re.escape(job_name.to_wire())
-            source = f"{escaped_wire}/\\d+:.*"
-
-        max_lines = request.max_total_lines if request.max_total_lines > 0 else DEFAULT_MAX_TOTAL_LINES
-
-        fetch_request = cluster_pb2.FetchLogsRequest(
-            source=source,
-            since_ms=request.since_ms,
-            cursor=request.cursor,
-            substring=request.substring,
-            max_lines=max_lines,
-            tail=request.tail,
-            min_level=request.min_level,
-        )
-
-        fetch_response = self.fetch_logs(fetch_request, ctx)
-        entries = fetch_response.entries
-
-        batch = cluster_pb2.Controller.TaskLogBatch(
-            task_id=request.id,
-            logs=entries,
-        )
-
-        truncated = max_lines > 0 and len(fetch_response.entries) >= max_lines
-
-        return cluster_pb2.Controller.GetTaskLogsResponse(
-            task_logs=[batch],
-            truncated=truncated,
-            cursor=fetch_response.cursor,
-        )
 
     # --- Profiling ---
 

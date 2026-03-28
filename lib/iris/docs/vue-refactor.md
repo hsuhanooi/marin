@@ -858,19 +858,18 @@ const filter = ref('')
 const level = ref('info')  // debug | info | warning | error
 const tailLines = ref(500)
 
-// Fetch logs via appropriate RPC endpoint
-const { data: logData, refresh } = useControllerRpc<LogResponse>('GetTaskLogs', {
-  id: props.taskId,
-  tail_lines: tailLines.value,
+// Fetch logs via FetchLogs RPC with regex source pattern
+const { data: logData, refresh } = useControllerRpc<FetchLogsResponse>('FetchLogs', {
+  source: props.taskId,
+  max_lines: tailLines.value,
 })
 
 // Auto-refresh every 30s when viewing
 const { active: autoRefreshActive } = useAutoRefresh(refresh, 30000)
 
 const filteredLogs = computed(() => {
-  if (!logData.value?.task_logs) return []
-  return logData.value.task_logs
-    .flatMap(batch => batch.logs)
+  if (!logData.value?.entries) return []
+  return logData.value.entries
     .filter(entry => {
       if (filter.value && !entry.data.includes(filter.value)) return false
       return levelPriority(entry.level) >= levelPriority(level.value)
