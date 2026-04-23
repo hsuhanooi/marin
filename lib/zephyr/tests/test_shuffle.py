@@ -13,6 +13,7 @@ from zephyr.shuffle import (
     ScatterReader,
     _write_chunk_frame,
     _write_scatter,
+    _write_scatter_meta,
 )
 
 
@@ -221,3 +222,48 @@ def test_external_sort_merge_cleans_up(tmp_path):
     iters = [iter([i]) for i in range(EXTERNAL_SORT_FAN_IN + 1)]
     list(external_sort_merge(iter(iters), merge_key=lambda x: x, external_sort_dir=str(tmp_path)))
     assert list(tmp_path.iterdir()) == [], "run files should be deleted after merge"
+
+
+# ---------------------------------------------------------------------------
+# Sidecar cache
+# ---------------------------------------------------------------------------
+
+
+def test_sidecar_bytes_cache(tmp_path):
+    """_read_sidecar_bytes caches sidecar bytes across calls."""
+    from zephyr.shuffle import _read_sidecar_bytes, _write_scatter_meta
+
+    data_path = str(tmp_path / "shard-0000.shuffle")
+    _write_scatter_meta(data_path, {"shards": {"0": [(0, 100)]}, "max_chunk_rows": {"0": 10}, "avg_item_bytes": 50.0})
+    meta_path = str(tmp_path / "shard-0000.scatter_meta")
+
+    first = _read_sidecar_bytes(meta_path)
+    second = _read_sidecar_bytes(meta_path)
+    assert first == second
+    assert first is second  # exact object identity proves cache hit
+
+
+def test_sidecar_slice_uses_cache(tmp_path):
+    """Reading different shards from the same sidecar reuses cached bytes."""
+    from zephyr.shuffle import _read_sidecar_slice
+
+    data_path = str(tmp_path / "shard-0000.shuffle")
+    _write_scatter_meta(
+        data_path,
+        {
+            "shards": {"0": [(0, 100)], "1": [(100, 200)]},
+            "max_chunk_rows": {"0": 10, "1": 20},
+            "avg_item_bytes": 50.0,
+        },
+    )
+
+    slice_0 = _read_sidecar_slice(data_path, "0")
+    slice_1 = _read_sidecar_slice(data_path, "1")
+
+    assert slice_0 is not None
+    assert slice_0.max_chunk_rows == 10
+    assert slice_0.ranges == ((0, 100),)
+
+    assert slice_1 is not None
+    assert slice_1.max_chunk_rows == 20
+    assert slice_1.ranges == ((100, 200),)
