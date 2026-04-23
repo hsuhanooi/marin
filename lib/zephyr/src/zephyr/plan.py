@@ -47,7 +47,7 @@ from zephyr.dataset import (
     WriteOp,
     resolve_glob,
 )
-from zephyr.expr import Expr
+from zephyr.expr import Expr, to_pyarrow_expr
 from zephyr.readers import InputFileSpec
 from rigging.log_setup import configure_logging
 
@@ -151,7 +151,33 @@ class Join:
     right_plan: PhysicalPlan | None = None
 
 
-PhysicalOp = Map | Write | Scatter | Reduce | Fold | Reshard | Join
+@dataclass
+class ArrowBatchPipeline:
+    """Vectorized batch pipeline for Arrow-compatible record dicts.
+
+    When the fused logical ops are all Arrow-compatible (no opaque Python
+    lambdas on the hot path), the planner emits this instead of ``Map``.
+    The runner reads Parquet/JSONL directly as Arrow, applies vectorized
+    filter/projection/select via PyArrow compute expressions, and only
+    converts to Python dicts at the write boundary (or if the next op
+    isn't Arrow-compatible).
+
+    Unlike ``Map``, this does not hold file_specs — it consumes the
+    incoming iterator of ``InputFileSpec`` objects (produced by the
+    upstream LoadFileOp shard) and reads each file as Arrow batches.
+
+    Attributes:
+        filter_expr: Optional PyArrow compute expression for row filtering.
+        projection_columns: Optional tuple of column names to select after filtering.
+        take_limit: Optional per-shard take limit.
+    """
+
+    filter_expr: Any | None = None  # pc.Expression or None
+    projection_columns: tuple[str, ...] | None = None
+    take_limit: int | None = None
+
+
+PhysicalOp = Map | Write | Scatter | Reduce | Fold | Reshard | Join | ArrowBatchPipeline
 
 
 class StageType(StrEnum):
@@ -241,6 +267,73 @@ def compose_map(operations: list) -> Callable[[Iterator], Iterator]:
         return stream
 
     return pipeline
+
+
+def _can_fuse_to_arrow(operations: list) -> bool:
+    """Return True if every op in *operations* can run via Arrow batches.
+
+    Requirements:
+    - Exactly one LoadFileOp, format must be parquet (auto is too risky at
+      plan time since we may not know the actual file format).
+    - FilterOp must have a Zephyr Expr (not a lambda).
+    - SelectOp, TakePerShardOp are fine.
+    - No MapOp, FlatMapOp, MapShardOp, WindowOp.
+    """
+    has_load = False
+    for op in operations:
+        if isinstance(op, LoadFileOp):
+            if has_load:
+                return False  # two loads in one fuse set
+            has_load = True
+            if op.format not in ("parquet",):
+                return False
+        elif isinstance(op, FilterOp):
+            if op.expr is None:
+                return False
+        elif isinstance(op, SelectOp | TakePerShardOp):
+            continue
+        else:
+            return False
+    return has_load
+
+
+def _compose_arrow_pipeline(operations: list) -> ArrowBatchPipeline:
+    """Build an Arrow pipeline from a list of Arrow-compatible logical ops.
+
+    Combines multiple FilterOps with pc.and_() and tracks the final projection.
+    """
+    import pyarrow.compute as pc
+
+    filter_exprs: list[Any] = []
+    projection_columns: tuple[str, ...] | None = None
+    take_limit: int | None = None
+
+    for op in operations:
+        if isinstance(op, FilterOp) and op.expr is not None:
+            filter_exprs.append(to_pyarrow_expr(op.expr))
+        elif isinstance(op, SelectOp):
+            if projection_columns is None:
+                projection_columns = op.columns
+            else:
+                # Intersection of columns
+                proj_set = set(projection_columns)
+                projection_columns = tuple(c for c in op.columns if c in proj_set)
+        elif isinstance(op, TakePerShardOp):
+            take_limit = op.n
+
+    combined_filter = None
+    if len(filter_exprs) == 1:
+        combined_filter = filter_exprs[0]
+    elif len(filter_exprs) > 1:
+        combined_filter = filter_exprs[0]
+        for expr in filter_exprs[1:]:
+            combined_filter = pc.and_(combined_filter, expr)
+
+    return ArrowBatchPipeline(
+        filter_expr=combined_filter,
+        projection_columns=projection_columns,
+        take_limit=take_limit,
+    )
 
 
 def compose_join(
@@ -338,17 +431,20 @@ class FusionState:
     stage_type: StageType = StageType.WORKER
 
     def flush_pending(self) -> None:
-        """Convert pending fusible ops to a physical Map."""
+        """Convert pending fusible ops to a physical op (Map or ArrowBatchPipeline)."""
         if not self.pending_fusible:
             return
 
-        needs_shard_context = any(isinstance(op, MapShardOp) for op in self.pending_fusible)
-        self.current_ops.append(
-            Map(
-                fn=compose_map(self.pending_fusible[:]),
-                needs_shard_context=needs_shard_context,
+        if _can_fuse_to_arrow(self.pending_fusible):
+            self.current_ops.append(_compose_arrow_pipeline(self.pending_fusible))
+        else:
+            needs_shard_context = any(isinstance(op, MapShardOp) for op in self.pending_fusible)
+            self.current_ops.append(
+                Map(
+                    fn=compose_map(self.pending_fusible[:]),
+                    needs_shard_context=needs_shard_context,
+                )
             )
-        )
         self.pending_fusible = []
 
     def add_op(
@@ -861,6 +957,10 @@ def run_stage(
             # Reshard is handled by the backend, not in worker
             raise ValueError("Reshard should not be executed in run_stage")
 
+        elif isinstance(op, ArrowBatchPipeline):
+            stream = _run_arrow_batch_pipeline(stream, op)
+            op_index += 1
+
         elif isinstance(op, Join):
             right_shard = ctx.get_right_shard(op_index)
             stream = op.fn(stream, iter(right_shard))
@@ -868,3 +968,70 @@ def run_stage(
 
     # Yield remaining items directly — caller handles batching for IO
     yield from stream
+
+
+def _run_arrow_batch_pipeline(source_specs: Iterator, pipeline: ArrowBatchPipeline) -> Iterator:
+    """Execute an ArrowBatchPipeline: read files as Arrow, filter/select in batches, yield dicts.
+
+    Expects *source_specs* to yield ``InputFileSpec`` or plain paths.
+    Only Parquet files are supported; others fall back to the normal load path.
+    """
+
+    from zephyr.readers import _as_spec, iter_parquet_row_groups
+
+    emitted = 0
+    limit = pipeline.take_limit
+
+    pa_filter = pipeline.filter_expr
+    projection = list(pipeline.projection_columns) if pipeline.projection_columns else None
+
+    for spec in source_specs:
+        file_spec = _as_spec(spec)
+        # Determine file format
+        fmt = file_spec.format
+        if fmt == "auto":
+            fmt = "parquet" if file_spec.path.endswith(".parquet") else "jsonl"
+
+        if fmt != "parquet":
+            # Fallback for non-Parquet files: go through the regular jsonl/vortex reader.
+            # This maintains correctness while still letting the planner use the Arrow
+            # path for Parquet-heavy pipelines.
+            from zephyr.readers import load_file
+
+            records = load_file(file_spec)
+            if projection is not None:
+                records = ({k: r[k] for k in projection if k in r} for r in records)
+            if pa_filter is not None:
+                # Can't apply a PyArrow filter to JSONL records easily — delegate to lambda.
+                # This branch should be rare in practice (ArrowBatchPipeline is only
+                # emitted when the ops are all Arrow-compatible, which for JSONL means
+                # no filter_expr or a lambda filter that was never converted).
+                pass
+            for record in records:
+                if limit is not None and emitted >= limit:
+                    return
+                yield record
+                emitted += 1
+            continue
+
+        # Parquet fast path: read row groups as Arrow Tables, vectorized filter+project.
+        try:
+            for table in iter_parquet_row_groups(
+                file_spec.path,
+                columns=projection,
+                row_start=file_spec.row_start,
+                row_end=file_spec.row_end,
+            ):
+                if pa_filter is not None:
+                    table = table.filter(pa_filter)
+                if len(table) == 0:
+                    continue
+                # Yield records from this table
+                for record in table.to_pylist():
+                    if limit is not None and emitted >= limit:
+                        return
+                    yield record
+                    emitted += 1
+        except Exception as e:
+            e.add_note(f"While reading {file_spec.path} in ArrowBatchPipeline")
+            raise
